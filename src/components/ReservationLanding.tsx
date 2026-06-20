@@ -18,6 +18,46 @@ type FormData = {
 
 type FormErrors = Partial<Record<keyof FormData, string>>;
 
+declare global {
+  interface Window {
+    Cashfree?: (config: { mode: "sandbox" | "production" }) => {
+      checkout: (options: {
+        paymentSessionId: string;
+        redirectTarget: "_self" | "_blank" | "_top" | "_modal";
+      }) => Promise<void>;
+    };
+  }
+}
+
+function loadCashfreeSdk() {
+  return new Promise<void>((resolve, reject) => {
+    if (window.Cashfree) {
+      resolve();
+      return;
+    }
+
+    const existingScript = document.querySelector(
+      'script[src="https://sdk.cashfree.com/js/v3/cashfree.js"]'
+    );
+
+    if (existingScript) {
+      existingScript.addEventListener("load", () => resolve());
+      existingScript.addEventListener("error", () =>
+        reject(new Error("Cashfree SDK failed to load."))
+      );
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.src = "https://sdk.cashfree.com/js/v3/cashfree.js";
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Cashfree SDK failed to load."));
+
+    document.body.appendChild(script);
+  });
+}
+
 const initialFormData: FormData = {
   customerName: "",
   phone: "+91 ",
@@ -33,7 +73,7 @@ export default function ReservationLanding() {
   const [bookingMode, setBookingMode] = useState<BookingMode>("table");
   const [formData, setFormData] = useState<FormData>(initialFormData);
   const [errors, setErrors] = useState<FormErrors>({});
-  const [bookingId, setBookingId] = useState("");
+  const [isPaying, setIsPaying] = useState(false);
 
   const todayDate = useMemo(() => {
     const today = new Date();
@@ -163,19 +203,70 @@ export default function ReservationLanding() {
     return Object.keys(nextErrors).length === 0;
   };
 
-  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
     if (!validateForm()) return;
 
-    const generatedBookingId = `DEMO-${Date.now().toString().slice(-6)}`;
-    setBookingId(generatedBookingId);
+    try {
+      setIsPaying(true);
+
+      const response = await fetch("/api/create-cashfree-order", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          amount: reservationAmount,
+          customerName: formData.customerName,
+          customerPhone: formData.phone,
+          bookingType: bookingMode,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        console.error("Cashfree order error:", data);
+        alert(data.error || "Payment order creation failed.");
+        return;
+      }
+
+      const paymentSessionId = data.paymentSessionId;
+
+      if (!paymentSessionId) {
+        console.error("Missing payment session:", data);
+        alert("Payment session not received from Cashfree.");
+        return;
+      }
+
+      await loadCashfreeSdk();
+
+      if (!window.Cashfree) {
+        alert("Cashfree SDK not loaded. Please refresh and try again.");
+        return;
+      }
+
+      const cashfree = window.Cashfree({
+        mode: "sandbox",
+      });
+
+      await cashfree.checkout({
+        paymentSessionId,
+        redirectTarget: "_self",
+      });
+    } catch (error) {
+      console.error(error);
+      alert("Something went wrong while starting payment.");
+    } finally {
+      setIsPaying(false);
+    }
   };
 
   const switchMode = (mode: BookingMode) => {
     setBookingMode(mode);
-    setBookingId("");
     setErrors({});
+    setIsPaying(false);
 
     setFormData((current) => ({
       ...current,
@@ -330,8 +421,7 @@ export default function ReservationLanding() {
               </p>
               <h3 className="mt-2 text-3xl font-black">{modeTitle}</h3>
               <p className="mt-2 text-sm leading-6 text-white/40">
-                Fill the details below. Your booking will stay pending until
-                reception confirms it.
+                Fill the details below. Payment will start after validation.
               </p>
             </div>
 
@@ -360,21 +450,6 @@ export default function ReservationLanding() {
                 Hall / Room
               </button>
             </div>
-
-            {bookingId && (
-              <div className="mb-5 rounded-3xl border border-green-400/20 bg-green-400/10 p-4">
-                <p className="text-xs tracking-[0.25em] text-green-200/60">
-                  REQUEST CREATED
-                </p>
-                <p className="mt-1 text-xl font-black text-green-200">
-                  {bookingId}
-                </p>
-                <p className="mt-2 text-sm text-green-100/55">
-                  Demo request created. Payment + Firebase saving will be added
-                  in next step.
-                </p>
-              </div>
-            )}
 
             <div className="space-y-4">
               <div>
@@ -409,9 +484,13 @@ export default function ReservationLanding() {
                 {errors.phone && <p className={errorClass}>{errors.phone}</p>}
               </div>
 
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <div>
-                  <div className="grid grid-cols-[1fr_112px] gap-3">
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-[1fr_140px]">
+                  <div>
+                    <label className="mb-2 block text-xs font-black uppercase tracking-[0.25em] text-[#f8dc8f]/45">
+                      Reservation Date
+                    </label>
+
                     <input
                       type="date"
                       min={todayDate}
@@ -419,21 +498,34 @@ export default function ReservationLanding() {
                       onChange={(event) =>
                         updateField("date", event.target.value)
                       }
-                      className="h-[58px] w-full rounded-2xl border border-white/10 bg-white/[0.06] px-5 text-[15px] font-black uppercase tracking-[0.06em] text-white outline-none [color-scheme:dark] transition focus:border-[#d6b25e]/60 focus:bg-white/[0.08] [&::-webkit-calendar-picker-indicator]:cursor-pointer [&::-webkit-calendar-picker-indicator]:opacity-80 [&::-webkit-date-and-time-value]:min-h-[1.5em] [&::-webkit-date-and-time-value]:text-left"
+                      className="h-[58px] w-full rounded-2xl border border-white/10 bg-white/[0.06] px-5 text-[15px] font-black uppercase tracking-[0.06em] text-white outline-none [color-scheme:dark] transition focus:border-[#d6b25e]/60 focus:bg-white/[0.08] [&::-webkit-calendar-picker-indicator]:cursor-pointer [&::-webkit-calendar-picker-indicator]:opacity-80"
                     />
+
+                    {errors.date && (
+                      <p className={errorClass}>{errors.date}</p>
+                    )}
+                  </div>
+
+                  <div>
+                    <label className="mb-2 block text-xs font-black uppercase tracking-[0.25em] text-[#f8dc8f]/45">
+                      Day
+                    </label>
 
                     <input
                       type="text"
                       value={selectedDay}
                       readOnly
                       placeholder="Day"
-                     className="h-[58px] w-full rounded-2xl border border-[#d6b25e]/20 bg-[#d6b25e]/10 px-3 text-center text-sm font-black tracking-[0.04em] text-[#f8dc8f] outline-none placeholder:text-[#f8dc8f]/45"
+                      className="h-[58px] w-full rounded-2xl border border-[#d6b25e]/25 bg-[#d6b25e]/10 px-3 text-center text-sm font-black tracking-[0.04em] text-[#f8dc8f] outline-none placeholder:text-[#f8dc8f]/45"
                     />
                   </div>
-                  {errors.date && <p className={errorClass}>{errors.date}</p>}
                 </div>
 
                 <div>
+                  <label className="mb-2 block text-xs font-black uppercase tracking-[0.25em] text-[#f8dc8f]/45">
+                    Arrival Time
+                  </label>
+
                   <input
                     type="time"
                     step={60}
@@ -441,9 +533,12 @@ export default function ReservationLanding() {
                     onChange={(event) =>
                       updateField("time", event.target.value)
                     }
-                    className={`${fieldClass} [color-scheme:dark]`}
+                    className="h-[58px] w-full rounded-2xl border border-white/10 bg-white/[0.06] px-5 text-[15px] font-black tracking-[0.06em] text-white outline-none [color-scheme:dark] transition focus:border-[#d6b25e]/60 focus:bg-white/[0.08]"
                   />
-                  {errors.time && <p className={errorClass}>{errors.time}</p>}
+
+                  {errors.time && (
+                    <p className={errorClass}>{errors.time}</p>
+                  )}
                 </div>
               </div>
 
@@ -548,9 +643,10 @@ export default function ReservationLanding() {
 
               <button
                 type="submit"
-                className="mt-3 w-full rounded-2xl bg-gradient-to-r from-[#f8dc8f] via-[#d6b25e] to-[#9e6f28] px-6 py-5 font-black text-black shadow-[0_20px_70px_rgba(214,178,94,0.26)] transition hover:scale-[1.01] active:scale-[0.98]"
+                disabled={isPaying}
+                className="mt-3 w-full rounded-2xl bg-gradient-to-r from-[#f8dc8f] via-[#d6b25e] to-[#9e6f28] px-6 py-5 font-black text-black shadow-[0_20px_70px_rgba(214,178,94,0.26)] transition hover:scale-[1.01] active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {buttonText}
+                {isPaying ? "Starting Secure Payment..." : buttonText}
               </button>
 
               <p className="text-center text-xs leading-6 text-white/40">
